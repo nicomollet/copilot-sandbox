@@ -1,80 +1,26 @@
-name: Assign Issues to Copilot (agent-ready)
+name: Assign Copilot on new issues
 
 on:
-  schedule:
-    - cron: "0 10 * * *"      # Daily at 10:00 UTC
   issues:
-    types: [closed]           # After an issue closes, queue up the next one
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "Assignment mode"
-        required: true
-        default: "auto"
-        type: choice
-        options: [auto, refactor]
-      label:
-        description: "Priority label (auto mode; empty = default priority)"
-        required: false
-        type: string
-        default: ""
-      force:
-        description: "Force assignment even if Copilot already has work"
-        required: false
-        type: boolean
-        default: false
+    types: [opened]
 
 permissions:
-  contents: read
   issues: write
+  contents: read
 
 jobs:
-  wait-grace-period:
+  assign-copilot:
     runs-on: ubuntu-latest
-    if: github.event_name == 'issues'
     steps:
-      - name: Wait 5 minutes for manual assignment
-        run: sleep 300
-
-  assign-issue:
-    runs-on: ubuntu-latest
-    needs: [wait-grace-period]
-    if: |
-      always() && (
-        needs.wait-grace-period.result == 'success' ||
-        needs.wait-grace-period.result == 'skipped'
-      )
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Decide mode
-        id: mode
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${{ inputs.mode }}"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
-            MODE="auto"
-          else
-            N="${{ github.event.issue.number }}"
-            LAST=$((N % 10))
-            if [ "$LAST" -eq 0 ] || [ "$LAST" -eq 5 ]; then MODE="refactor"; else MODE="auto"; fi
-          fi
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "Assignment mode: $MODE"
-
-      - name: Assign (GraphQL by actor ID)
+      - name: Assign Copilot via GraphQL
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.COPILOT_ASSIGN_PAT }}
           script: |
-            const mode   = '${{ steps.mode.outputs.mode }}';
-            const labelOverride = '${{ inputs.label }}' || null;
-            const force  = '${{ inputs.force }}' === 'true';
-            const owner  = context.repo.owner;
-            const repo   = context.repo.repo;
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
 
-            // ---- 1) Find Copilot agent actor (repo-scoped) ----
+            // 1) Discover the Copilot actor for this repository
             const repoInfo = await github.graphql(`
               query($owner: String!, $repo: String!) {
                 repository(owner: $owner, name: $repo) {
@@ -83,176 +29,29 @@ jobs:
                     nodes { login __typename ... on Bot { id } ... on User { id } }
                   }
                 }
-              }`,
-              { owner, repo }
-            );
+              }
+            `, { owner, repo });
 
             const actors = repoInfo.repository?.suggestedActors?.nodes ?? [];
-            // Copilot actor can appear as 'copilot' or 'copilot-swe-agent' depending on rollout
+            // Copilot may appear as 'copilot' or 'copilot-swe-agent' depending on rollout
             const copilotActor =
               actors.find(a => a.login === 'copilot' && a.__typename === 'Bot') ||
               actors.find(a => a.login === 'copilot-swe-agent' && a.__typename === 'Bot') ||
               actors.find(a => a.__typename === 'Bot' && a.login.toLowerCase().includes('copilot'));
 
             if (!copilotActor) {
-              core.info(`Suggested actors: ${actors.map(a => `${a.login}:${a.__typename}`).join(', ') || '(none)'}`);
-              throw new Error('Copilot agent actor not found. Confirm Copilot coding agent is enabled for this repo and visible in Assignees.');
+              core.setFailed('Copilot actor not found. Ensure Copilot coding agent is enabled and visible as an Assignee in this repo.');
+              return;
             }
-            const repoId = repoInfo.repository.id;
-            const copilotBotId = copilotActor.id;
-            core.info(`Using Copilot actor: ${copilotActor.login} (${copilotActor.__typename})`);
 
-            // ---- 2) If Copilot already has open issues, optionally skip unless forced ----
-            const assigned = await github.graphql(`
-              query($owner: String!, $repo: String!, $login: String!) {
-                repository(owner: $owner, name: $repo) {
-                  issues(first: 50, states: OPEN, filterBy: { assignee: $login }) {
-                    nodes { id number title url labels(first: 10){nodes{name}} }
-                  }
+            // 2) Assign the newly opened issue to Copilot
+            const issueId = context.payload.issue.node_id; // GraphQL ID for the opened issue
+            await github.graphql(`
+              mutation($assignable: ID!, $assignees: [ID!]!) {
+                addAssigneesToAssignable(input: { assignableId: $assignable, assigneeIds: $assignees }) {
+                  assignable { ... on Issue { number assignees(first:10){ nodes { login } } } }
                 }
-              }`,
-              { owner, repo, login: copilotActor.login }
-            );
-
-            const current = assigned.repository.issues.nodes;
-            if (current.length > 0) {
-              core.info(`Copilot already assigned to: ${current.map(i => `#${i.number}`).join(', ')}`);
-              if (!force) {
-                core.info('Skip (force=false). Trigger manually via workflow_dispatch with force=true if needed.');
-                return;
               }
-              core.info('force=true → continuing to assign another issue.');
-            }
+            `, { assignable: issueId, assignees: [copilotActor.id] });
 
-            // ---- 3) Mode: refactor → create and assign a refactor issue ----
-            async function createRefactorIssue() {
-              // Look up label ID (optional)
-              const q = await github.graphql(`
-                query($owner: String!, $repo: String!, $name: String!) {
-                  repository(owner: $owner, name: $repo) {
-                    label(name: $name) { id }
-                  }
-                }`,
-                { owner, repo, name: "refactor" }
-              );
-              const refactorLabelId = q.repository.label?.id || null;
-
-              const m = await github.graphql(`
-                mutation($repositoryId: ID!, $title: String!, $body: String!, $assigneeIds: [ID!]) {
-                  createIssue(input: {
-                    repositoryId: $repositoryId,
-                    title: $title,
-                    body: $body,
-                    assigneeIds: $assigneeIds
-                  }) { issue { id number url title assignees(first:10){nodes{login}} } }
-                }`,
-                {
-                  repositoryId: repoId,
-                  title: `Weekly Refactor – ${new Date().toISOString().slice(0,10)}`,
-                  body: [
-                    'Review and improve code quality:',
-                    '- Fix failing tests/linters',
-                    '- Remove duplication',
-                    '- Address security warnings',
-                    '- Improve performance & accessibility',
-                    '- Raise test coverage',
-                    '',
-                    '**Rules:**',
-                    '- Keep changes minimal and safe',
-                    '- Run linters/tests before completion'
-                  ].join('\n'),
-                  assigneeIds: [copilotBotId]
-                }
-              );
-              core.info(`Created and assigned refactor issue: ${m.createIssue.issue.url}`);
-
-              if (refactorLabelId) {
-                await github.graphql(`
-                  mutation($id: ID!, $labelIds: [ID!]!) {
-                    addLabelsToLabelable(input:{labelableId:$id, labelIds:$labelIds}) {
-                      labelable { ... on Issue { labels(first:10){nodes{name}} } }
-                    }
-                  }`,
-                  { id: m.createIssue.issue.id, labelIds: [refactorLabelId] }
-                );
-                core.info(`Added 'refactor' label.`);
-              }
-            }
-
-            // ---- 4) Mode: auto → pick an unassigned issue by label priority and assign ----
-            async function assignNextIssue(labelOverride) {
-              const priorities = labelOverride ? [labelOverride] : ['bug', 'documentation', 'enhancement'];
-              let candidate = null;
-
-              // Helper to find first unassigned/non-subissue issue
-              const pick = (issues) => issues.find(i => (i.assignees.nodes.length === 0));
-
-              for (const label of priorities) {
-                const q = await github.graphql(`
-                  query($owner: String!, $repo: String!, $label: String!) {
-                    repository(owner: $owner, name: $repo) {
-                      issues(first: 50, states: OPEN, labels: [$label], orderBy:{field:CREATED_AT, direction:ASC}) {
-                        nodes { id number title url assignees(first:10){nodes{login}} labels(first:10){nodes{name}} }
-                      }
-                    }
-                  }`,
-                  { owner, repo, label }
-                );
-                candidate = pick(q.repository.issues.nodes);
-                if (candidate) break;
-              }
-
-              if (!candidate && !labelOverride) {
-                const q = await github.graphql(`
-                  query($owner: String!, $repo: String!) {
-                    repository(owner: $owner, name: $repo) {
-                      issues(first: 100, states: OPEN, orderBy:{field:CREATED_AT, direction:ASC}) {
-                        nodes { id number title url assignees(first:10){nodes{login}} labels(first:10){nodes{name}} }
-                      }
-                    }
-                  }`,
-                  { owner, repo }
-                );
-                candidate = pick(q.repository.issues.nodes);
-              }
-
-              if (!candidate) {
-                core.info('No suitable open, unassigned issues → creating refactor issue.');
-                await createRefactorIssue();
-                return;
-              }
-
-              core.info(`Assigning ${owner}/${repo}#${candidate.number} to Copilot…`);
-              const m = await github.graphql(`
-                mutation($assignable: ID!, $assignees: [ID!]!) {
-                  addAssigneesToAssignable(input:{assignableId:$assignable, assigneeIds:$assignees}) {
-                    assignable { ... on Issue { assignees(first:10){nodes{login}} } }
-                  }
-                }`,
-                { assignable: candidate.id, assignees: [copilotBotId] }
-              );
-              core.info(`✓ Assigned: ${candidate.url}`);
-            }
-
-            if (mode === 'refactor') {
-              await createRefactorIssue();
-            } else {
-              await assignNextIssue(labelOverride);
-            }
-
-            // Optional: leave a breadcrumb comment
-            try {
-              const head = await github.graphql(`
-                query($owner:String!, $repo:String!) {
-                  repository(owner:$owner, name:$repo) { issues(last:1){nodes{ number id }} }
-                }`,
-                { owner, repo }
-              );
-              const last = head.repository.issues.nodes[0];
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: last.number,
-                body: "🤖 Copilot assigned via workflow. Track progress in the **Agents** tab; a PR will follow."
-              });
-            } catch (e) {
-              core.info(`Comment skipped: ${e.message}`);
-            }
+            core.info(`Assigned issue #${context.payload.issue.number} to ${copilotActor.login}`);
