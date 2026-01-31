@@ -1,5 +1,6 @@
+# .github/workflows/assign-copilot.yml
+name: Auto-assign Copilot on new issues (with diagnostics)
 
-name: Auto-assign Copilot to new issues
 on:
   issues:
     types: [opened]
@@ -10,13 +11,36 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: Assign Copilot
+      - name: Try assigning Copilot (and log any error)
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.issues.addAssignees({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              assignees: ['copilot']
-            });
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const number = context.issue.number;
+
+            try {
+              const res = await github.rest.issues.addAssignees({
+                owner, repo, issue_number: number, assignees: ['copilot']
+              });
+              core.info(`HTTP ${res.status} addAssignees -> ${JSON.stringify(res.data.assignees.map(a => a.login))}`);
+              const hasCopilot = res.data.assignees.some(a => a.login.toLowerCase() === 'copilot');
+              if (!hasCopilot) {
+                throw new Error('API call returned 200 but Copilot not present in assignee list.');
+              }
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: number,
+                body: '✅ Assigned **Copilot** via API. The coding agent should start shortly.'
+              });
+            } catch (err) {
+              core.warning(`Failed to assign Copilot: ${err.message}`);
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: number,
+                body: [
+                  '⚠️ I tried to assign **Copilot** automatically but it did not stick.',
+                  '',
+                  '**Next step:** Please click **Assign to Copilot** (or add Copilot in the Assignees) to start the coding agent.',
+                ].join('\n')
+              });
+              core.setFailed('Copilot assignment did not apply; manual assignment required.');
+            }
